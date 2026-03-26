@@ -1,14 +1,82 @@
 const os = require("os");
+const path = require("path");
+const fs = require("fs");
+const childProcess = require("child_process");
 const { app, Notification, dialog, clipboard, shell } = require("electron");
 const address = require("address");
 const ipp = require("ipp");
 const { machineIdSync } = require("node-machine-id");
 const Store = require("electron-store");
-const { getPaperSizeInfo, getPaperSizeInfoAll } = require("win32-pdf-printer");
 const { v7: uuidv7 } = require("uuid");
-const fs = require("fs");
+
+/**
+ * win32-pdf-printer 的 paper-size-info.exe 会被 electron-builder 解压到 app.asar.unpacked。
+ * 运行环境下它仍然使用 app.asar 路径，导致文件不存在。这里提前重写 child_process 的执行路径。
+ */
+function patchWin32PdfPrinterBinPath() {
+  if (process.platform !== "win32" || !app.isPackaged) return;
+  const pattern = /app\.asar([\\/])(?=node_modules[\\/]win32-pdf-printer[\\/]paper-size-info\.exe)/i;
+  const unpackedSegment = "app.asar.unpacked";
+  const unpackedBin = path.join(
+    process.resourcesPath,
+    unpackedSegment,
+    "node_modules",
+    "win32-pdf-printer",
+    "paper-size-info.exe",
+  );
+  if (!fs.existsSync(unpackedBin)) return;
+
+  const rewriteCommand = (command) => {
+    if (typeof command !== "string" || !pattern.test(command)) return command;
+    if (command.includes(unpackedSegment)) return command;
+    const replaced = command.replace(pattern, `${unpackedSegment}$1`);
+    // 仅包裹 exe 路径，避免把参数一起包进引号导致命令解析失败
+    const unpackedBinNormalized = unpackedBin.replace(/\\/g, "/");
+    const quoteIfNeeded = (exePath) =>
+      exePath.includes(" ") ? `"${exePath}"` : exePath;
+    if (
+      replaced.startsWith(`"${unpackedBin}"`) ||
+      replaced.startsWith(`"${unpackedBinNormalized}"`)
+    ) {
+      return replaced;
+    }
+    if (replaced === unpackedBin || replaced === unpackedBinNormalized) {
+      return quoteIfNeeded(replaced);
+    }
+    if (replaced.startsWith(unpackedBin + " ")) {
+      return `${quoteIfNeeded(unpackedBin)}${replaced.slice(unpackedBin.length)}`;
+    }
+    if (replaced.startsWith(unpackedBinNormalized + " ")) {
+      return `${quoteIfNeeded(unpackedBinNormalized)}${replaced.slice(
+        unpackedBinNormalized.length,
+      )}`;
+    }
+    return replaced;
+  };
+
+  const wrap = (original) =>
+    function patched(command, ...args) {
+      return original.call(childProcess, rewriteCommand(command), ...args);
+    };
+
+  childProcess.execFile = wrap(childProcess.execFile);
+  childProcess.exec = wrap(childProcess.exec);
+  childProcess.execSync = wrap(childProcess.execSync);
+  const spawn = childProcess.spawn;
+  childProcess.spawn = function(command, ...args) {
+    return spawn.call(childProcess, rewriteCommand(command), ...args);
+  };
+  const spawnSync = childProcess.spawnSync;
+  childProcess.spawnSync = function(command, ...args) {
+    return spawnSync.call(childProcess, rewriteCommand(command), ...args);
+  };
+}
+
+patchWin32PdfPrinterBinPath();
+
+const { getPaperSizeInfo, getPaperSizeInfoAll } = require("win32-pdf-printer");
 let buildInfo = {};
-const buildInfoPath = require("path").join(__dirname, "../build-info.json");
+const buildInfoPath = path.join(__dirname, "../build-info.json");
 if (fs.existsSync(buildInfoPath)) {
   buildInfo = require(buildInfoPath);
 }
@@ -365,8 +433,16 @@ function initServeEvent(server) {
     socket.on("getPaperSizeInfo", (printer) => {
       console.log(`插件端 ${socket.id}: getPaperSizeInfo`);
       if (process.platform === "win32") {
-        let fun = printer ? getPaperSizeInfo : getPaperSizeInfoAll;
-        let paper = fun();
+        const printerName =
+          typeof printer === "string"
+            ? printer
+            : printer && typeof printer.printer === "string"
+              ? printer.printer
+              : "";
+        let paper = getPaperSizeInfoAll();
+        if (printerName) {
+          paper = paper.find((item) => item.PrinterName === printerName) || null;
+        }
         paper && socket.emit("paperSizeInfo", paper);
       }
     });
